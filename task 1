@@ -1,0 +1,473 @@
+"""
+Weather API Integration & Data Visualization (Beginner Friendly)
+
+What this script does:
+1) Asks the user for a city name.
+2) Calls the OpenWeatherMap "Current Weather" API using requests.
+3) Prints a clean weather summary (temperature, humidity, pressure, wind, condition).
+4) Saves the fetched data to a timestamped CSV using pandas.
+5) Generates professional visualizations using Matplotlib + Seaborn:
+   - Bar chart for temperature, humidity, pressure, wind speed
+   - Pie chart for weather condition summary
+   - Line chart to compare weather values (across the metrics)
+
+Requirements:
+- Set OPENWEATHER_API_KEY as an environment variable, OR paste it when prompted.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import requests
+import seaborn as sns
+
+
+API_BASE_URL = "https://api.openweathermap.org/data/2.5/weather"
+WTTR_BASE_URL = "https://wttr.in"
+DEFAULT_TIMEOUT_SECONDS = 12
+
+
+@dataclass(frozen=True)
+class WeatherData:
+    city: str
+    country: str
+    fetched_at_utc: str
+    temperature_c: float
+    humidity_pct: int
+    pressure_hpa: int
+    wind_speed_mps: float
+    condition_main: str
+    condition_description: str
+
+    def to_flat_dict(self) -> Dict[str, Any]:
+        # A flat dict is convenient for CSV saving via pandas.
+        return {
+            "city": self.city,
+            "country": self.country,
+            "fetched_at_utc": self.fetched_at_utc,
+            "temperature_c": self.temperature_c,
+            "humidity_pct": self.humidity_pct,
+            "pressure_hpa": self.pressure_hpa,
+            "wind_speed_mps": self.wind_speed_mps,
+            "condition_main": self.condition_main,
+            "condition_description": self.condition_description,
+        }
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_api_key() -> str:
+    """
+    Read the API key from environment variable OPENWEATHER_API_KEY.
+    If it's not set, ask the user to paste it.
+    """
+    api_key = (os.getenv("OPENWEATHER_API_KEY") or "").strip()
+    if api_key:
+        return api_key
+
+    # Fallback: prompt the user (keeps the project simple for beginners).
+    # If we're in a non-interactive environment (piped input / CI), skip prompting.
+    if not sys.stdin.isatty():
+        return ""
+
+    print("OpenWeatherMap API key not found in environment variable OPENWEATHER_API_KEY.")
+    try:
+        api_key = input("Please paste your OpenWeatherMap API key: ").strip()
+    except EOFError:
+        return ""
+    return api_key
+
+
+def fetch_current_weather(city: str, api_key: str) -> Dict[str, Any]:
+    """
+    Fetch current weather JSON from OpenWeatherMap.
+
+    Raises:
+        requests.exceptions.RequestException for network-related issues
+        ValueError for invalid responses or API-level errors
+    """
+    if not api_key:
+        raise ValueError(
+            "Missing API key. Set OPENWEATHER_API_KEY or paste a valid key when prompted."
+        )
+
+    params = {
+        "q": city,
+        "appid": api_key,
+        "units": "metric",  # Celsius
+    }
+
+    try:
+        response = requests.get(API_BASE_URL, params=params, timeout=DEFAULT_TIMEOUT_SECONDS)
+    except requests.exceptions.RequestException as exc:
+        raise requests.exceptions.RequestException(
+            "Network error while contacting OpenWeatherMap. Check your internet connection."
+        ) from exc
+
+    # OpenWeatherMap returns useful JSON even on errors (e.g., 404, 401).
+    # We'll parse JSON if possible and show user-friendly messages.
+    content_type = (response.headers.get("Content-Type") or "").lower()
+    if "application/json" in content_type:
+        payload: Dict[str, Any] = response.json()
+    else:
+        payload = {}
+
+    if response.status_code != 200:
+        message = ""
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or "").strip()
+
+        if response.status_code == 401:
+            raise ValueError(
+                "Authentication failed (HTTP 401). Your API key is missing or invalid."
+            )
+        if response.status_code == 404:
+            raise ValueError(
+                f"City not found. Please check the spelling and try again. Details: {message or 'N/A'}"
+            )
+
+        raise ValueError(
+            f"OpenWeatherMap API error (HTTP {response.status_code}). {message or 'Please try again later.'}"
+        )
+
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected response format from the API.")
+
+    return payload
+
+
+def fetch_current_weather_no_key(city: str) -> Dict[str, Any]:
+    """
+    No-key fallback using wttr.in (public endpoint).
+
+    Endpoint:
+      https://wttr.in/<city>?format=j1
+
+    Raises:
+        requests.exceptions.RequestException for network-related issues
+        ValueError for invalid responses
+    """
+    url = f"{WTTR_BASE_URL}/{city}"
+    params = {"format": "j1"}
+
+    try:
+        response = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT_SECONDS)
+    except requests.exceptions.RequestException as exc:
+        raise requests.exceptions.RequestException(
+            "Network error while contacting the public weather endpoint. Check your internet connection."
+        ) from exc
+
+    if response.status_code != 200:
+        raise ValueError(f"Public weather endpoint error (HTTP {response.status_code}).")
+
+    try:
+        payload: Dict[str, Any] = response.json()
+    except ValueError as exc:
+        raise ValueError("Public weather endpoint returned non-JSON data.") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected response format from the public weather endpoint.")
+
+    return payload
+
+
+def parse_weather(payload: Dict[str, Any]) -> WeatherData:
+    """
+    Convert API JSON into a simple Python dataclass.
+    """
+    city = str(payload.get("name") or "").strip()
+    sys_info = payload.get("sys") or {}
+    country = str(sys_info.get("country") or "").strip()
+
+    main = payload.get("main") or {}
+    wind = payload.get("wind") or {}
+    weather_list = payload.get("weather") or []
+    first_weather = weather_list[0] if isinstance(weather_list, list) and weather_list else {}
+
+    temperature_c = float(main.get("temp"))
+    humidity_pct = int(main.get("humidity"))
+    pressure_hpa = int(main.get("pressure"))
+    wind_speed_mps = float(wind.get("speed"))
+
+    condition_main = str(first_weather.get("main") or "Unknown")
+    condition_description = str(first_weather.get("description") or "Unknown")
+
+    return WeatherData(
+        city=city or "Unknown",
+        country=country or "Unknown",
+        fetched_at_utc=_now_utc_iso(),
+        temperature_c=temperature_c,
+        humidity_pct=humidity_pct,
+        pressure_hpa=pressure_hpa,
+        wind_speed_mps=wind_speed_mps,
+        condition_main=condition_main,
+        condition_description=condition_description,
+    )
+
+
+def parse_weather_wttr(payload: Dict[str, Any], city_input: str) -> WeatherData:
+    """
+    Parse wttr.in (format=j1) JSON into WeatherData.
+    """
+    area = ""
+    country = ""
+    try:
+        nearest = payload.get("nearest_area") or []
+        first_nearest = nearest[0] if isinstance(nearest, list) and nearest else {}
+        area_name = first_nearest.get("areaName") or []
+        country_name = first_nearest.get("country") or []
+        area = (
+            str(area_name[0].get("value"))
+            if isinstance(area_name, list) and area_name
+            else ""
+        )
+        country = (
+            str(country_name[0].get("value"))
+            if isinstance(country_name, list) and country_name
+            else ""
+        )
+
+        current = payload.get("current_condition") or []
+        first_current = current[0] if isinstance(current, list) and current else {}
+
+        temperature_c = float(first_current.get("temp_C"))
+        humidity_pct = int(first_current.get("humidity"))
+        pressure_hpa = int(first_current.get("pressure"))
+
+        wind_kmph = float(first_current.get("windspeedKmph"))
+        wind_speed_mps = wind_kmph / 3.6  # km/h -> m/s
+
+        desc_list = first_current.get("weatherDesc") or []
+        desc = (
+            str(desc_list[0].get("value"))
+            if isinstance(desc_list, list) and desc_list
+            else "Unknown"
+        )
+        condition_main = desc.split()[0] if desc and desc != "Unknown" else "Unknown"
+        condition_description = desc
+    except (TypeError, KeyError, ValueError) as exc:
+        raise ValueError("Public weather data format changed or is incomplete.") from exc
+
+    return WeatherData(
+        city=(area or city_input or "Unknown"),
+        country=(country or "Unknown"),
+        fetched_at_utc=_now_utc_iso(),
+        temperature_c=temperature_c,
+        humidity_pct=humidity_pct,
+        pressure_hpa=pressure_hpa,
+        wind_speed_mps=wind_speed_mps,
+        condition_main=condition_main,
+        condition_description=condition_description,
+    )
+
+
+def print_weather_summary(w: WeatherData) -> None:
+    """
+    Keep terminal output clean and professional.
+    """
+    # Use simple ASCII characters for reliable terminal rendering on all Windows shells.
+    title = f"Weather Report - {w.city}, {w.country}"
+    print("\n" + title)
+    print("-" * len(title))
+    print(f"Fetched at (UTC): {w.fetched_at_utc}")
+    print(f"Temperature     : {w.temperature_c:.1f} deg C")
+    print(f"Humidity        : {w.humidity_pct:d} %")
+    print(f"Pressure        : {w.pressure_hpa:d} hPa")
+    print(f"Wind Speed      : {w.wind_speed_mps:.1f} m/s")
+    print(f"Condition       : {w.condition_main} ({w.condition_description})")
+
+
+def save_to_csv(w: WeatherData, data_dir: Path) -> Path:
+    """
+    Save a single-row CSV file with a timestamp in the filename.
+    """
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_city = "".join(ch for ch in w.city if ch.isalnum() or ch in (" ", "-", "_")).strip()
+    safe_city = safe_city.replace(" ", "_") or "city"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    csv_path = data_dir / f"weather_{safe_city}_{timestamp}.csv"
+    df = pd.DataFrame([w.to_flat_dict()])
+    df.to_csv(csv_path, index=False, encoding="utf-8")
+    return csv_path
+
+
+def create_visualizations(w: WeatherData, outputs_dir: Path) -> Dict[str, Path]:
+    """
+    Create and save:
+    - bar chart: weather metrics
+    - pie chart: condition summary
+    - line chart: compare metrics (across the metrics)
+    """
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    # A modern Seaborn theme makes charts look professional by default.
+    sns.set_theme(style="whitegrid", context="talk", font_scale=0.9)
+
+    metrics = pd.DataFrame(
+        {
+            "Metric": ["Temperature (°C)", "Humidity (%)", "Pressure (hPa)", "Wind (m/s)"],
+            "Value": [
+                w.temperature_c,
+                float(w.humidity_pct),
+                float(w.pressure_hpa),
+                w.wind_speed_mps,
+            ],
+        }
+    )
+
+    # -------------------------
+    # 1) Bar chart
+    # -------------------------
+    fig1, ax1 = plt.subplots(figsize=(10, 5.5))
+    palette = ["#4C78A8", "#72B7B2", "#F58518", "#54A24B"]
+    # Seaborn v0.14+ deprecates `palette` without `hue`. This keeps behavior and avoids warnings.
+    sns.barplot(
+        data=metrics,
+        x="Metric",
+        y="Value",
+        hue="Metric",
+        palette=palette,
+        legend=False,
+        ax=ax1,
+    )
+    ax1.set_title(f"Weather Metrics — {w.city}", pad=12, weight="bold")
+    ax1.set_xlabel("")
+    ax1.set_ylabel("Value")
+    ax1.tick_params(axis="x", rotation=10)
+    for container in ax1.containers:
+        ax1.bar_label(container, fmt="%.1f", padding=3, fontsize=11)
+    fig1.tight_layout()
+    bar_path = outputs_dir / "bar_weather_metrics.png"
+    fig1.savefig(bar_path, dpi=220, bbox_inches="tight")
+    plt.close(fig1)
+
+    # -------------------------
+    # 2) Pie chart (condition summary)
+    # -------------------------
+    # With current weather, there's typically one condition.
+    # To still create a meaningful summary pie chart, we show:
+    #   - Current condition (100%)
+    condition_labels = [w.condition_main]
+    condition_sizes = [1]
+
+    fig2, ax2 = plt.subplots(figsize=(7, 7))
+    colors = ["#7C3AED"]  # purple
+    wedges, texts, autotexts = ax2.pie(
+        condition_sizes,
+        labels=condition_labels,
+        autopct=lambda pct: "100%" if pct > 0 else "",
+        startangle=90,
+        colors=colors,
+        textprops={"color": "#111827"},
+    )
+    ax2.set_title(f"Weather Condition Summary — {w.city}", pad=14, weight="bold")
+    for t in autotexts:
+        t.set_color("white")
+        t.set_fontweight("bold")
+    fig2.tight_layout()
+    pie_path = outputs_dir / "pie_weather_condition.png"
+    fig2.savefig(pie_path, dpi=220, bbox_inches="tight")
+    plt.close(fig2)
+
+    # -------------------------
+    # 3) Line chart (compare weather values)
+    # -------------------------
+    fig3, ax3 = plt.subplots(figsize=(10, 5.5))
+    sns.lineplot(
+        data=metrics,
+        x="Metric",
+        y="Value",
+        marker="o",
+        linewidth=3,
+        color="#EF4444",  # modern red
+        ax=ax3,
+    )
+    ax3.set_title(f"Comparison Across Weather Metrics — {w.city}", pad=12, weight="bold")
+    ax3.set_xlabel("")
+    ax3.set_ylabel("Value")
+    ax3.tick_params(axis="x", rotation=10)
+    for x, y in zip(metrics["Metric"], metrics["Value"]):
+        ax3.text(x, y, f" {y:.1f}", va="bottom", fontsize=11, color="#111827")
+    fig3.tight_layout()
+    line_path = outputs_dir / "line_weather_comparison.png"
+    fig3.savefig(line_path, dpi=220, bbox_inches="tight")
+    plt.close(fig3)
+
+    return {"bar": bar_path, "pie": pie_path, "line": line_path}
+
+
+def main() -> int:
+    print("Weather API Integration & Visualization (OpenWeatherMap)")
+    print("------------------------------------------------------")
+
+    city = input("Enter a city name: ").strip()
+    if not city:
+        print("Please enter a non-empty city name. Exiting.")
+        return 1
+
+    api_key = get_api_key()
+
+    try:
+        payload = fetch_current_weather(city=city, api_key=api_key)
+        weather = parse_weather(payload)
+    except ValueError as exc:
+        # If the API key is missing/invalid, automatically fall back to a public endpoint
+        # so the project can still run end-to-end without secrets.
+        msg = str(exc).lower()
+        if "missing api key" in msg or "authentication failed" in msg:
+            print("\nNote: OpenWeatherMap key not available/valid. Using public fallback endpoint.")
+            try:
+                fallback_payload = fetch_current_weather_no_key(city=city)
+                weather = parse_weather_wttr(fallback_payload, city_input=city)
+            except Exception as fallback_exc:
+                print(f"\nError: {fallback_exc}")
+                return 1
+        else:
+            print(f"\nError: {exc}")
+            return 1
+    except requests.exceptions.RequestException as exc:
+        print(f"\nError: {exc}")
+        return 1
+    except (KeyError, TypeError) as exc:
+        # If the API changes shape unexpectedly, we handle it gracefully.
+        print("\nError: Received an unexpected response format from the API.")
+        print(f"Details: {exc}")
+        return 1
+
+    print_weather_summary(weather)
+
+    project_root = Path(__file__).resolve().parent
+    data_dir = project_root / "data"
+    outputs_dir = project_root / "outputs"
+
+    try:
+        csv_path = save_to_csv(weather, data_dir=data_dir)
+        chart_paths = create_visualizations(weather, outputs_dir=outputs_dir)
+    except Exception as exc:
+        print("\nWarning: Weather fetched, but saving/visualization failed.")
+        print(f"Details: {exc}")
+        return 1
+
+    print("\nSaved files")
+    print("-----------")
+    print(f"CSV  : {csv_path}")
+    print(f"Bar  : {chart_paths['bar']}")
+    print(f"Pie  : {chart_paths['pie']}")
+    print(f"Line : {chart_paths['line']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
