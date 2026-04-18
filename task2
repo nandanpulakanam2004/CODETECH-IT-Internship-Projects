@@ -1,0 +1,255 @@
+import os
+from datetime import datetime
+import pandas as pd
+import matplotlib.pyplot as plt
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+
+
+def analyze_data(csv_path: str):
+    df = pd.read_csv(csv_path)
+
+    # Basic summary statistics
+    summary = df.describe(include="all").transpose()
+
+    # Simple key insights based on numeric columns
+    insights: list[str] = []
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+
+    if numeric_cols:
+        main_col = numeric_cols[0]
+        col_series = df[main_col]
+        insights.append(
+            f"{main_col} ranges from {col_series.min()} to {col_series.max()} "
+            f"with an average of {col_series.mean():.2f}."
+        )
+
+        if "Expenses" in df.columns and "Sales" in df.columns:
+            profit = df["Sales"] - df["Expenses"]
+            insights.append(
+                f"Average daily profit (Sales - Expenses) is {profit.mean():.2f}."
+            )
+
+        date_col = None
+        for candidate in ["Date", "date", "DATE"]:
+            if candidate in df.columns:
+                date_col = candidate
+                break
+        if date_col and "Sales" in df.columns:
+            max_idx = df["Sales"].idxmax()
+            insights.append(
+                f"Highest Sales occurred on {df.loc[max_idx, date_col]} "
+                f"with a value of {df.loc[max_idx, 'Sales']}."
+            )
+
+    # Generate multiple charts if possible
+    chart_paths: list[str] = []
+    if numeric_cols:
+        # Chart 1: line chart for first numeric column
+        col = numeric_cols[0]
+        plt.figure(figsize=(6, 3))
+        df[col].plot(kind="line", title=f"Trend of {col}")
+        plt.xlabel("Index")
+        plt.ylabel(col)
+        plt.tight_layout()
+        chart1_path = "chart1.png"
+        plt.savefig(chart1_path, dpi=150)
+        plt.close()
+        chart_paths.append(chart1_path)
+
+        # Chart 2: bar chart for Sales by Date, if available
+        if "Sales" in df.columns:
+            plt.figure(figsize=(6, 3))
+            x = df.index.astype(str)
+            if "Date" in df.columns:
+                x = df["Date"].astype(str)
+            plt.bar(x, df["Sales"])
+            plt.title("Sales by Record")
+            plt.xticks(rotation=45, ha="right")
+            plt.ylabel("Sales")
+            plt.tight_layout()
+            chart2_path = "chart2.png"
+            plt.savefig(chart2_path, dpi=150)
+            plt.close()
+            chart_paths.append(chart2_path)
+
+        # Chart 3: bar chart for Expenses by Date, if available
+        if "Expenses" in df.columns:
+            plt.figure(figsize=(6, 3))
+            x = df.index.astype(str)
+            if "Date" in df.columns:
+                x = df["Date"].astype(str)
+            plt.bar(x, df["Expenses"], color="orange")
+            plt.title("Expenses by Record")
+            plt.xticks(rotation=45, ha="right")
+            plt.ylabel("Expenses")
+            plt.tight_layout()
+            chart3_path = "chart3.png"
+            plt.savefig(chart3_path, dpi=150)
+            plt.close()
+            chart_paths.append(chart3_path)
+
+    return df, summary, chart_paths, insights
+
+
+def _footer(canvas, doc):
+    """
+    Draw a footer at the bottom of each page.
+    """
+    footer_text = "This report was automatically generated using Python."
+    canvas.saveState()
+    canvas.setFont("Helvetica-Oblique", 8)
+    canvas.setFillColor(colors.HexColor("#555555"))
+    # Place near bottom center
+    width, height = A4
+    canvas.drawCentredString(width / 2.0, 15, footer_text)
+    canvas.restoreState()
+
+
+def build_pdf(
+    pdf_path: str,
+    summary: pd.DataFrame,
+    chart_paths: list[str] | None,
+    insights: list[str] | None = None,
+    title: str = "Data Report",
+    project_name: str = "Sample Project",
+    author: str = "nandan",
+    company: str = "NANDA TECH PARK",
+    generated_date: str | None = None,
+):
+    doc = SimpleDocTemplate(pdf_path, pagesize=A4)
+    base_styles = getSampleStyleSheet()
+
+    # Custom styles for better visual hierarchy
+    styles = {
+        "title": ParagraphStyle(
+            "title",
+            parent=base_styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=22,
+            textColor=colors.HexColor("#1F4E79"),  # dark blue
+            alignment=1,  # center
+        ),
+        "header_label": ParagraphStyle(
+            "header_label",
+            parent=base_styles["Normal"],
+            fontName="Helvetica-Bold",
+            textColor=colors.HexColor("#555555"),
+        ),
+        "header_value": ParagraphStyle(
+            "header_value",
+            parent=base_styles["Normal"],
+            textColor=colors.HexColor("#000000"),
+        ),
+        "section_title": ParagraphStyle(
+            "section_title",
+            parent=base_styles["Heading2"],
+            fontName="Helvetica-Bold",
+            textColor=colors.HexColor("#1F4E79"),
+        ),
+        "normal": base_styles["Normal"],
+    }
+    elements = []
+
+    if generated_date is None:
+        generated_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    elements.append(Paragraph(title, styles["title"]))
+    elements.append(Spacer(1, 12))
+
+    # Report header details (label + value on separate lines)
+    elements.append(Paragraph("Project name:", styles["header_label"]))
+    elements.append(Paragraph(project_name, styles["header_value"]))
+    elements.append(Paragraph("Generated date:", styles["header_label"]))
+    elements.append(Paragraph(generated_date, styles["header_value"]))
+    elements.append(Paragraph("Author name:", styles["header_label"]))
+    elements.append(Paragraph(author, styles["header_value"]))
+    elements.append(Paragraph("Company:", styles["header_label"]))
+    elements.append(Paragraph(company, styles["header_value"]))
+    elements.append(Spacer(1, 12))
+
+    elements.append(Paragraph("Summary Statistics", styles["section_title"]))
+    elements.append(Spacer(1, 6))
+
+    table_data = [["Column", "Count", "Mean", "Std", "Min", "25%", "50%", "75%", "Max"]]
+    for col, row in summary.iterrows():
+        table_data.append([
+            str(col),
+            f"{row.get('count', ''):.0f}" if pd.notna(row.get("count")) else "",
+            f"{row.get('mean', ''):.2f}" if pd.notna(row.get("mean")) else "",
+            f"{row.get('std', ''):.2f}" if pd.notna(row.get("std")) else "",
+            f"{row.get('min', ''):.2f}" if pd.notna(row.get("min")) else "",
+            f"{row.get('25%', ''):.2f}" if pd.notna(row.get('25%')) else "",
+            f"{row.get('50%', ''):.2f}" if pd.notna(row.get('50%')) else "",
+            f"{row.get('75%', ''):.2f}" if pd.notna(row.get('75%')) else "",
+            f"{row.get('max', ''):.2f}" if pd.notna(row.get("max")) else "",
+        ])
+
+    table = Table(table_data, repeatRows=1)
+    table.setStyle(TableStyle([
+        # Header row
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, 0), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        # Body
+        ("FONTSIZE", (0, 1), (-1, -1), 9),
+        ("ALIGN", (1, 1), (-1, -1), "RIGHT"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BBBBBB")),
+        # Alternate row background colors for readability
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#E7EDF4")]),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 12))
+
+    # Key insights section
+    if insights:
+        elements.append(Paragraph("Key Insights", styles["section_title"]))
+        elements.append(Spacer(1, 6))
+        for line in insights:
+            elements.append(Paragraph(f"• {line}", styles["normal"]))
+        elements.append(Spacer(1, 12))
+
+    if chart_paths:
+        elements.append(Paragraph("Charts", styles["section_title"]))
+        elements.append(Spacer(1, 6))
+        for idx, path in enumerate(chart_paths, start=1):
+            if os.path.exists(path):
+                # Label each chart
+                elements.append(Paragraph(f"Chart {idx}", styles["header_label"]))
+                elements.append(Spacer(1, 4))
+                img = RLImage(path, width=420, height=210)
+                elements.append(img)
+                elements.append(Spacer(1, 10))
+
+    doc.build(elements, onFirstPage=_footer, onLaterPages=_footer)
+
+
+def main():
+    csv_path = "data.csv"
+    pdf_path = "report.pdf"
+
+    df, summary, chart_paths, insights = analyze_data(csv_path)
+    build_pdf(
+        pdf_path,
+        summary,
+        chart_paths,
+        insights,
+        title=f"Report for {os.path.basename(csv_path)}",
+        project_name="Sample Sales Analysis",
+        author="nandan",
+        company="NANDA TECH PARK",
+    )
+
+    print(f"Report generated: {pdf_path}")
+    # Clean up chart image files
+    for path in chart_paths:
+        if os.path.exists(path):
+            os.remove(path)
+
+
+if __name__ == "__main__":
+    main()
